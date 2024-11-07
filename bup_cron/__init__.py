@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#!/usr/local/bin/bin/python3
 # -*- coding: utf-8
 """
 simple wrapper around bup index and save designed to be ran in cron
@@ -47,6 +47,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import traceback
 
 
@@ -86,27 +87,19 @@ class ArgumentConfigParser(argparse.ArgumentParser):
                            help="""the directory to backup to, defaults
                                   to $BUP_DIR (%s)"""
                            % defdir)
-        group.add_argument('-n', '--name', default=None,
-                           help="""base of the branch name passed to bup,
-                                   defaults to the hostname""")
-        group.add_argument('-b', '--branch-name', default=None,
-                           help="""full name of the branch name passed to bup,
-                                   overrides --name""")
+        # using the hostname as branch name
+        group.add_argument('-n', '--name', default=socket.gethostname(),
+                           help="""name of the backup passed to bup,
+                                   defaults to hostname (%(default)s)""")
         group.add_argument('-r', '--remote', default=None,
                            help="""a SSH address to save the backup remotely
                            (example: bup@example.com:repos/repo.bup)""")
         group.add_argument('-x', '--exclude', action='append',
-                           help="""exclude path from the backup,
+                           help="""exclude regex pattern,
                                    will be passed as --exclude to bup""")
         group.add_argument('--exclude-rx', action='append',
-                           help="""exclude path matching regex pattern,
+                           help="""exclude regex pattern,
                                    will be passed as --exclude-rx to bup""")
-        group.add_argument('--exclude-from', action='append',
-                           help="""read --exclude paths from filename,
-                                   will be passed as --exclude-from to bup""")
-        group.add_argument('--exclude-rx-from', action='append',
-                           help="""read --exclude-rx patterns from filename,
-                                   will be passed as --exclude-rx-from to bup""")
         group = self.add_argument_group('Extra jobs',
                                         '''Those are extra features that
                                         bup-cron will run before or after
@@ -164,7 +157,7 @@ tries to be silent if not specified.
         group.add_argument('-l', '--logfile', default=sys.stdout,
                            help="""file where logs should be written,
                                    defaults to stdout""")
-        levels = [i for i in logging._levelNames.keys()
+        levels = [i for i in logging.getLevelNamesMapping()
                   if (type(i) == str and i != 'NOTSET')]
         group.add_argument('--syslog', nargs='?', default=None,
                            type=str.upper, action='store',
@@ -188,10 +181,10 @@ tries to be silent if not specified.
             return ['--' + arg_line]
 
     def parse_args(self):
-        """Process arguments list
+        """process argument list
 
-        Inject system and user config files and cleanup various
-        arguments and defaults that couldn't be done otherwise."""
+        inject system and user config files and cleanup various
+        arguments and defaults that couldn't be done otherwise"""
         configs = map(lambda x: os.path.expanduser(x), self.configs)
         for conf in configs:
             try:
@@ -206,10 +199,6 @@ tries to be silent if not specified.
             self.exit(0, __version__ + "\n")
         if 'BUP_DIR' not in os.environ and not args.repository:
             self.error('argument -d/--repository is required')
-
-        if args.name and args.branch_name:
-            self.error('The options --name and --branch-name cannot '
-                       'be used together.')
 
         # merge the path and paths arguments
         if args.path:
@@ -241,7 +230,7 @@ class Snapshot(object):
                  verbose=0, call=subprocess.check_call, mountpattern=None):
         """initialise the snapshot array
 
-        path is expected to be part of the target filesystem; log and warn are
+        path is expected to be the root of the filesystem; log and warn are
         logging utilities; call is a way to call processes that will return
         true on success or false otherwise"""
         self.src_path = path
@@ -297,9 +286,8 @@ class LvmSnapshot(Snapshot):
     def __enter__(self):
         """set the LVM and mount it"""
         self.vg_lv = None
-        mountpoint = self.find_mountpoint()
-        if mountpoint:
-            device = self.find_device(mountpoint)
+        if os.path.ismount(self.path):
+            device = self.find_device()
             if device:
                 # vg, lv
                 self.vg_lv = LvmSnapshot.find_vg_lv(device)
@@ -307,64 +295,49 @@ class LvmSnapshot(Snapshot):
                 # forced cleanup
                 self.cleanup(True)
                 cmd = ['lvcreate', '--size', self.size, '--snapshot',
-                       '--permission', 'r',
                        '--name', self.snapname(), device]
                 if self.verbose <= 0:
                     cmd += ['--quiet']
                 if self.verbose >= 3:
                     cmd += ['--verbose']
-                logging.debug('creating snapshot %s' % self.snapname())
                 if self.call(cmd):
-                    logging.debug('making sure mountpoint %s exists'
-                                  % self.mountpoint())
                     if make_dirs_helper(self.mountpoint()):
                         logging.debug('mountpoint %s created'
-                                      % self.mountpoint())
+                                     % self.mountpoint())
                     self.exists = True
-                    if self.call(['mount', '-o', 'ro',
-                                  self.device(),
+                    if self.call(['mount', self.device(),
                                   self.mountpoint()]):
-                        relpath = os.path.relpath(self.path, mountpoint)
-                        self.path = os.path.join(self.mountpoint(), relpath)
+                        self.path = self.mountpoint()
                     else:
-                        logging.warn("""failed to mount snapshot %s on %s,
+                        logging.warning("""failed to mount snapshot %s on %s,
 skipping snapshotting"""
                                      % (self.snapname(),
                                         self.mountpoint()))
                         self.cleanup()
                 else:
-                    logging.warn("""failed to create snapshot %s/%s,
+                    logging.warning("""failed to create snapshot %s/%s,
 skipping snapshooting"""
                                  % self.vg_lv)
             else:
                 # XXX: we could try to find the parent mountpoint...
                 # see https://github.com/pfrouleau/bup/commit/1244a2da0bf480591b19b9b6123a51ab8662ab56
-                logging.warn('%s is not a LVM mountpoint, skipping snapshotting'
+                logging.warning('%s is not a LVM mountpoint, skipping snapshotting'
                              % self.path)
         else:
-            logging.warn('Could not find mountpoint for %s, skipping snapshotting'
+            logging.warning('%s is not a mountpoint, skipping snapshotting'
                          % self.path)
         return self
 
-    def find_mountpoint(self):
-        path = os.path.realpath(self.path)
-        while not os.path.ismount(path):
-            dirname = os.path.dirname(path)
-            if dirname == path:
-                return None
-            path = dirname
-        return path
-
-    def find_device(self, mountpoint):
+    def find_device(self):
         """find device based on mountpoint path
 
         returns the device or False if none found"""
 
         mounts = subprocess.check_output(['mount'])
         try:
-            return re.match(r".*^(/[^ ]*) on %s .*" % mountpoint, mounts,
+            return re.match(r".*^(/[^ ]*) on %s .*" % self.path, mounts,
                             re.MULTILINE | re.DOTALL).group(1)
-        except:  # noqa
+        except:
             return False
 
     @staticmethod
@@ -408,13 +381,14 @@ skipping snapshooting"""
             else:
                 raise
         if os.path.ismount(m):
-            logging.debug('umounting %s' % m)
-            if not self.call(['umount', m]):
-                logging.warn('failed to umount %s' % m)
-        logging.debug('removing directory %s' % m)
+            if self.call(['umount', m]):
+                logging.debug('umounted %s' % m)
+            else:
+                logging.warning('failed to umount %s' % m)
         try:
             os.removedirs(m)
-        except:  # noqa
+            logging.debug('removed directory %s' % m)
+        except:
             pass
         device = self.device()
         try:
@@ -425,9 +399,10 @@ skipping snapshooting"""
             if self.verbose >= 3:
                 cmd += ['--verbose']
             if stat.S_ISBLK(os.stat(device).st_mode):
-                logging.debug('dropping snapshot %s' % device)
-                if not self.call(cmd):
-                    logging.warn('failed to drop snapshot %s' % device)
+                if self.call(cmd):
+                    logging.debug('dropped snapshot %s' % device)
+                else:
+                    logging.warning('failed to drop snapshot %s' % device)
         except OSError:
             # normal: the device doesn't exist, moving on
             return
@@ -447,7 +422,7 @@ if sys.platform.startswith('cygwin'):
             if self.create_snapshot(device):
                 self.mount(fs_root)
             else:
-                logging.warn("""failed to create snapshot for %s, skipping snapshotting""" %
+                logging.warning("""failed to create snapshot for %s, skipping snapshotting""" %
                              self.path)
             return self
 
@@ -459,11 +434,11 @@ if sys.platform.startswith('cygwin'):
                     self.shadow_id = None
                     self.exits = False
                 else:
-                    logging.warn('failed to drop snapshot %s' % device)
+                    logging.warning('failed to drop snapshot %s' % device)
             if os.path.exists(self.mountpattern):
                 self._fail_if_mounted()
-                logging.debug('removing directory %s' % self.mountpattern)
                 os.rmdir(self.mountpattern)
+                logging.debug('removed directory %s' % self.mountpattern)
 
         def _convert_path(self, path, spec):
             return subprocess.check_output(['cygpath', spec, path]).replace('\n', '')
@@ -482,11 +457,11 @@ if sys.platform.startswith('cygwin'):
                 output = subprocess.check_output(['vshadow', '-p', device])
                 # * SNAPSHOT ID = {5a698842-f325-404a-83e7-6a7fa08760a1}
                 self.shadow_id = re.search("\* SNAPSHOT ID = (\{[0-9A-Fa-f-]{36}\})", output).group(1)
-                logging.debug('shadow copy created: %s' % self.shadow_id)
+                logging.debug('Shadow copy created: %s' % self.shadow_id)
                 self.exists = True
                 return True
-            except Exception as e:
-                logging.warn('vss snapshot failed, id=%s: %s' % self.shadow_id, e)
+            except:
+                logging.warning('vss snapshot failed, id=%s' % self.shadow_id)
                 return False
 
         def _fail_if_mounted(self):
@@ -511,7 +486,6 @@ if sys.platform.startswith('cygwin'):
         def mount(self, fs_root):
             """mountpattern must be a path in linux format
             """
-            logging.debug('making sure mountpoint %s exists' % self.mountpattern)
             if make_dirs_helper(self.mountpattern):
                 logging.debug('mountpoint %s created' % self.mountpattern)
             winmount = self._convert2dos(self.mountpattern)
@@ -520,7 +494,7 @@ if sys.platform.startswith('cygwin'):
             if self.call(['vshadow', "-el=%s,%s" % (self.shadow_id, winmount)]):
                 self.path = self.path.replace(fs_root, self.mountpattern)
             else:
-                logging.warn("""failed to mount snapshot %s on %s, skipping snapshotting""" %
+                logging.warning("""failed to mount snapshot %s on %s, skipping snapshotting""" %
                              (self.shadow_id, self.mountpattern))
                 self.cleanup(True)
 
@@ -558,7 +532,7 @@ class Bup():
         if parity:
             cmd = base_cmd + ['--par2-ok']
             if not GlobalLogger().check_call(cmd):
-                logging.warn("""bup reports par2(1) as not working,
+                logging.warning("""bup reports par2(1) as not working,
 no recovery blocks written""")
                 return False
             cmd = base_cmd + ['--generate']
@@ -569,13 +543,12 @@ no recovery blocks written""")
         else: # this is --check
             # XXX: always use --quick for now
             cmd = base_cmd + ['--quick']
-            logging.info('verifying bup repository')
+            logging.info('verify bup repository')
         return GlobalLogger().check_call(cmd)
-
+            
 
     @staticmethod
-    def index(path, excludes, excludes_rx, excludes_from, excludes_rx_from,
-              one_file_system):
+    def index(path, excludes, excludes_rx, one_file_system):
         logging.info('indexing %s' % quote(path))
         # XXX: should be -q(uiet) unless verbose > 0 - but bup
         # index has no -q
@@ -586,10 +559,6 @@ no recovery blocks written""")
             cmd += map((lambda ex: '--exclude=' + ex), excludes)
         if excludes_rx:
             cmd += map((lambda ex: '--exclude-rx=' + ex), excludes_rx)
-        if excludes_from:
-            cmd += map((lambda ex: '--exclude-from=' + ex), excludes_from)
-        if excludes_rx_from:
-            cmd += map((lambda ex: '--exclude-rx-from=' + ex), excludes_rx_from)
         if one_file_system:
             cmd += ['--one-file-system']
         cmd += [path]
@@ -625,13 +594,7 @@ class Pidfile():
     remove stale files (with invalid pids or that the process
     disappeared)
 
-    it will also cleanup after itself
-
-    this shouldn't have been implemented and should instead use the
-    more common lockfile package:
-
-    https://pypi.python.org/pypi/lockfile
-    """
+    it will also cleanup after itself"""
 
     def __init__(self, path):
         """setup various parameters"""
@@ -661,9 +624,9 @@ class Pidfile():
     def create(self):
         """initialise pid file"""
         try:
-            logging.debug('locking pidfile %s' % self.pidfile)
             self.pidfd = os.open(self.pidfile,
                                  os.O_CREAT | os.O_WRONLY | os.O_EXCL)
+            logging.debug('locked pidfile %s' % self.pidfile)
         except OSError as e:
             if e.errno == errno.EEXIST:
                 pid = self._check()
@@ -673,7 +636,7 @@ class Pidfile():
                 else:
                     try:
                         os.remove(self.pidfile)
-                        logging.warn('removed stale lockfile %s'
+                        logging.warning('removed staled lockfile %s'
                                      % (self.pidfile))
                         self.pidfd = os.open(self.pidfile,
                                              os.O_CREAT
@@ -691,13 +654,13 @@ class Pidfile():
             else:
                 raise
 
-        os.write(self.pidfd, str(os.getpid()))
+        os.write(self.pidfd, bytes(os.getpid()))
         os.close(self.pidfd)
         return self
 
     def remove(self):
         """helper function to actually remove the pid file"""
-        logging.debug('removing pidfile %s' % self.pidfile)
+        logging.debug('removed pidfile %s' % self.pidfile)
         os.remove(self.pidfile)
 
     def _check(self):
@@ -720,22 +683,11 @@ class Pidfile():
                 # not an integer
                 logging.debug("not an integer: %s" % pidstr)
                 return False
-
-            # First check the proc filesystem, which may not be available.
-            if os.path.exists('/proc/%d' % pid):
-                return pid
-
             try:
                 os.kill(pid, 0)
-            except OSError as e:
-                if e.errno == errno.ESRCH:
-                    # Not running
-                    logging.debug("process %d is not running" % pid)
-                    return False
-                elif e.errno == errno.EPERM:
-                    # No permission to signal this process!
-                    logging.debug("can't deliver signal to process %d" % pid)
-                    return pid
+            except OSError:
+                logging.debug("can't deliver signal to %s" % pid)
+                return False
             else:
                 return pid
 
@@ -782,13 +734,12 @@ class Singleton(object):
     def __new__(cls, *args, **kwargs):
         """override constructor to return a single object"""
         if not cls._instance:
-            cls._instance = super(Singleton, cls).__new__(
-                cls, *args, **kwargs)
+            cls._instance = super(Singleton, cls).__new__(cls)
         return cls._instance
 
     def __init__(self, *args, **kwargs):
         """return if __init__ was previously ran"""
-        super(Singleton, self).__init__(self, *args, **kwargs)
+        super(Singleton, self).__init__()
         i = self._init
         self._init = True
         return i
@@ -833,7 +784,7 @@ even in info and debug
                 elif args.verbose > 0:
                     sh.setLevel(logging.INFO)
                 else:
-                    sh.setLevel(logging.WARNING)
+                    sh.setLevel(logging.DEBUG)
                 self._log = sh.stream
                 logging.getLogger('').addHandler(sh)
                 logging.debug('configured stdout level %s' % sh.level)
@@ -846,7 +797,7 @@ even in info and debug
                 logging.debug('configured file output to %s, level %s' % (args.logfile, fh.level))
 
     def check_call(self, cmd):
-        """call a process, log it to the logfile
+        """call a procss, log it to the logfile
 
         return false if it fails, otherwise true"""
         try:
@@ -858,7 +809,7 @@ even in info and debug
             subprocess.check_call(cmd, stdout=stdout, stderr=self._warn,
                                   close_fds=True)
         except subprocess.CalledProcessError:
-            logging.warn('command failed')
+            logging.warning('command failed')
             return False
         return True
 
@@ -925,13 +876,14 @@ class BupCronMetaData(object):
         self.disk_usage()
 
     def versions(self):
-        self.local_bup = subprocess.check_output(['bup', '--version']).rstrip('\n')
-        git_output = subprocess.check_output(['git', '--version']).rstrip('\n')
-        self.local_git = re.match('git version (.*)', git_output).group(1)
+        self.local_bup = subprocess.check_output(['bup', 'version'])
+        git_output = subprocess.check_output(['git', '--version'])
+        print(f"{git_output}")
+        self.local_git = re.match('git version (.*)', git_output.decode()).group(1)
         self.local_python = platform.python_version()
         if self.remote:
             server, repo_path = self.remote.split(':')
-            cmd = ('bup --version ;'
+            cmd = ('bup version ;'
                    'git --version ;'
                    'python --version 2>&1' )
             cmd = [ 'ssh', '-T', server, cmd ]
@@ -948,9 +900,10 @@ class BupCronMetaData(object):
         else:
             server, repo_path = self.remote.split(':')
             obj_path = os.path.join(repo_path, 'objects/pack')
+            remote_cmd = ('%s "%s" | cut -f1 || echo "-1"') % (' '.join(self.du_cmd), obj_path)
             cmd = ['ssh', '-T', server, ' '.join(self.du_cmd), "'%s'" % obj_path]
         logging.debug('calling command `%s`' % cmd)
-        self.sizes.append(int(subprocess.check_output(cmd).split('\t')[0]))
+        self.sizes.append(int(subprocess.check_output(cmd).decode().split('\t')[0]))
 
     @staticmethod
     def format_bytes(num, suffix='B'):
@@ -999,10 +952,10 @@ Remote versions
         size_diff = self.sizes[-1] - self.sizes[0]
         str = 'total repository size (before/after/diff): %s/%s/%s (%s/%s/%s), version (bup/git/python): %s/%s/%s' \
               % (
-                  self.format_bytes(self.sizes[0]),
+                  self.format_bytes(self.sizes[-2]),
                   self.format_bytes(self.sizes[-1]),
                   self.format_bytes(size_diff),
-                  self.sizes[0],
+                  self.sizes[-2],
                   self.sizes[-1],
                   size_diff,
                   self.local_bup,
@@ -1029,9 +982,9 @@ Remote versions
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
-        (out, err) = process.communicate(str(self))
+        (out, err) = process.communicate(str(self).encode())
         if process.returncode != 0:
-            logging.warn('failed to save bup note: `%s%s` (%d)' % (out, err, process.returncode))
+            logging.warning('failed to save bup note: `%s%s` (%d)' % (out, err, process.returncode))
         return process.returncode == 0
 
 
@@ -1043,26 +996,22 @@ def process(args):
     # current lvm object to cleanup in exception handlers
     for path in args.paths:
         with Snapshot.select(args.snapshot)(path, args.size,
-                                            logging.info, logging.warn,
+                                            logging.info, logging.warning,
                                             GlobalLogger().verbose,
                                             GlobalLogger().check_call,
                                             args.mountpoint) as snapshot:
+            rep_info = dict()
 
             # XXX: this shouldn't be in the loop like this, bup index should be
             # able to index multiple paths
             #
             # unfortunately, `bup index -x / /var` skips /var...
-            if not Bup.index(snapshot.path, args.exclude, args.exclude_rx,
-                             args.exclude_from, args.exclude_rx_from, True):
-                logging.error('Skipping save because index failed!')
+            if not Bup.index(snapshot.path, args.exclude, args.exclude_rx, True):
+                logging.error('skipping save because index failed!')
                 success = False
                 continue
 
-            if args.branch_name:
-                branch = args.branch_name
-            else:
-                branch = '%s-%s' % (args.name if args.name else socket.gethostname(),
-                                    snapshot.src_path.replace('/', '_'))
+            branch = '%s-%s' % (args.name, snapshot.src_path.replace('/', '_'))
             if not Bup.save([snapshot.path], branch, snapshot.path, args.remote):
                 logging.error('bup save failed on %s' % snapshot.path)
                 success = False
@@ -1074,11 +1023,11 @@ def process(args):
                 # success) but that would mean refactoring all of
                 # check_call()
                 if not Bup.fsck(args.remote):
-                    logging.warn('fsck determined there was an error and could not fix it')
+                    logging.warning('fsck determined there was an error and could not fix it')
                     success = False
 
             if args.parity and not Bup.fsck(args.remote, parity=True):
-                logging.warn('could not generate par2 parity blocks')
+                logging.warning('could not generate par2 parity blocks')
 
             if args.stats:
                 args.stats.branch = branch
@@ -1092,8 +1041,8 @@ def process(args):
 def bail(status, timer, msg=None):
     """cleanup on exit"""
     if msg:
-        logging.warn(msg)
-    logging.info('bup-cron %s completed, %s' % (__version__, timer))
+        logging.warning(msg)
+    logging.info('bup-cron completed, %s' % timer)
     sys.exit(status)
 
 
@@ -1107,27 +1056,22 @@ def main():
     # initialize GlobalLogger singleton
     GlobalLogger(args)
 
-    logging.info('bup-cron %s starting' % __version__)
     try:
-        initialised = False
-        if not os.path.exists(os.environ['BUP_DIR']):
+        if make_dirs_helper(os.environ['BUP_DIR']):
             if not Bup.init(args.remote):
-                bail(3, timer, 'failed to initialize bup repo')
-            initialised = True
-
-        with Pidfile(args.pidfile):
-            if args.clear and not initialised:
+                logging.error('failed to initialize bup repo')
+        else:
+            if args.clear:
                 if not Bup.clear_index():
                     logging.warning('failed to clear the index')
 
+        with Pidfile(args.pidfile):
             success = process(args)
-    except SystemExit:
-        return
-    except:  # noqa
-        # Get exception type and error, but print the traceback in debug only.
+    except:
+        # get exception type and error, but print the traceback in debug
         t, e, b = sys.exc_info()
         if args.debug:
-            logging.warn(traceback.print_tb(b))
+            logging.warning(traceback.print_tb(b))
         bail(2, timer, 'aborted with unhandled exception %s: %s' % (t.__name__, e))
 
     if success:
